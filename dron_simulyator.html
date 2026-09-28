@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dron Simulyator</title>
+<style>
+  :root{
+    --bg:#0b1220; --panel:#121b2e; --text:#e8eef7; --muted:#8ea0bd;
+    --accent:#4ade80; --accent2:#38bdf8; --warn:#f87171;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+    padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);}
+  #wrap{max-width:900px;margin:0 auto;padding:16px;}
+  h1{font-size:18px;margin:4px 0 12px;text-align:center;color:var(--accent2);}
+  #topbar{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-bottom:10px;}
+  button{background:var(--panel);color:var(--text);border:1px solid #26314a;border-radius:8px;
+    padding:8px 14px;font-size:13px;cursor:pointer;}
+  button:hover{border-color:var(--accent2);}
+  #status{font-size:12px;color:var(--muted);text-align:center;margin-bottom:10px;}
+  #stage{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;}
+  canvas{background:#0e1626;border:1px solid #22304a;border-radius:10px;max-width:100%;}
+  #hud{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;background:var(--panel);
+    border:1px solid #22304a;border-radius:10px;padding:12px;font-size:13px;min-width:220px;}
+  .hud-label{color:var(--muted);}
+  .hud-val{color:var(--accent);font-variant-numeric:tabular-nums;text-align:right;}
+  #help{font-size:12px;color:var(--muted);text-align:center;margin-top:10px;line-height:1.6;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>🚁 Dron Simulyator</h1>
+  <div id="topbar">
+    <button id="connectBtn">🔌 Arduino'ni ulash</button>
+    <button id="resetBtn">↺ Qayta boshlash</button>
+  </div>
+  <div id="status">Arduino ulanmagan — klaviatura bilan boshqarishingiz mumkin</div>
+
+  <div id="stage">
+    <canvas id="mapCanvas" width="420" height="420"></canvas>
+    <canvas id="attCanvas" width="220" height="220"></canvas>
+    <div id="hud">
+      <span class="hud-label">Balandlik</span><span class="hud-val" id="hAlt">0 m</span>
+      <span class="hud-label">Tezlik</span><span class="hud-val" id="hSpd">0 m/s</span>
+      <span class="hud-label">Gaz (Throttle)</span><span class="hud-val" id="hThr">0%</span>
+      <span class="hud-label">Yaw</span><span class="hud-val" id="hYaw">0°</span>
+      <span class="hud-label">Roll</span><span class="hud-val" id="hRoll">0°</span>
+      <span class="hud-label">Pitch</span><span class="hud-val" id="hPitch">0°</span>
+      <span class="hud-label">Holat</span><span class="hud-val" id="hArm">Yerda</span>
+    </div>
+  </div>
+
+  <div id="help">
+    Klaviatura: <b>W/S</b> gaz, <b>A/D</b> yaw, <b>strelkalar</b> pitch/roll.<br>
+    Arduino ulanganda jostiklar avtomatik ustunlik qiladi.
+  </div>
+</div>
+
+<script>
+(function(){
+  const mapCv = document.getElementById('mapCanvas');
+  const mctx = mapCv.getContext('2d');
+  const attCv = document.getElementById('attCanvas');
+  const actx = attCv.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const connectBtn = document.getElementById('connectBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  // ---- Boshqaruv holati: -100..100 (yaw,roll,pitch), 0..100 (throttle) ----
+  let ctrl = {yaw:0, throttle:0, roll:0, pitch:0, serialActive:false};
+  let keys = {};
+
+  window.addEventListener('keydown', e=>{keys[e.key.toLowerCase()]=true;});
+  window.addEventListener('keyup', e=>{keys[e.key.toLowerCase()]=false;});
+
+  function keyboardControl(){
+    if (ctrl.serialActive) return; // Arduino ulangan bo'lsa klaviaturani e'tiborsiz qoldiramiz
+    let thr = ctrl.throttle, yaw=0, roll=0, pitch=0;
+    if (keys['w']) thr = Math.min(100, thr+2);
+    if (keys['s']) thr = Math.max(0, thr-2);
+    if (keys['a']) yaw = -60;
+    if (keys['d']) yaw = 60;
+    if (keys['arrowup']) pitch = 60;
+    if (keys['arrowdown']) pitch = -60;
+    if (keys['arrowleft']) roll = -60;
+    if (keys['arrowright']) roll = 60;
+    ctrl.throttle = thr; ctrl.yaw = yaw; ctrl.roll = roll; ctrl.pitch = pitch;
+  }
+
+  // ---- Web Serial ulanish ----
+  let port, reader, lineBuf = '';
+  connectBtn.addEventListener('click', async ()=>{
+    if (!('serial' in navigator)){
+      statusEl.textContent = "Bu brauzer Web Serial'ni qo'llamaydi. Chrome/Edge dan foydalaning.";
+      return;
+    }
+    try{
+      port = await navigator.serial.requestPort();
+      await port.open({baudRate:9600});
+      statusEl.textContent = "✅ Arduino ulandi — jostik boshqaruvda";
+      ctrl.serialActive = true;
+      readLoop();
+    }catch(err){
+      statusEl.textContent = "Ulanmadi: " + err.message;
+    }
+  });
+
+  async function readLoop(){
+    const decoder = new TextDecoderStream();
+    const inputDone = port.readable.pipeTo(decoder.writable);
+    reader = decoder.readable.getReader();
+    try{
+      while(true){
+        const {value, done} = await reader.read();
+        if (done) break;
+        if (value){
+          lineBuf += value;
+          let idx;
+          while((idx = lineBuf.indexOf('\n')) >= 0){
+            const line = lineBuf.slice(0, idx).trim();
+            lineBuf = lineBuf.slice(idx+1);
+            parseLine(line);
+          }
+        }
+      }
+    }catch(e){
+      statusEl.textContent = "Ulanish uzildi: " + e.message;
+      ctrl.serialActive = false;
+    }
+  }
+
+  function parseLine(line){
+    // Format: Y:xx,T:xx,R:xx,P:xx
+    const parts = line.split(',');
+    let vals = {};
+    parts.forEach(p=>{
+      const [k,v] = p.split(':');
+      if (k && v !== undefined && !isNaN(parseFloat(v))) vals[k]=parseFloat(v);
+    });
+    if (vals.Y !== undefined) ctrl.yaw = vals.Y;
+    if (vals.T !== undefined) ctrl.throttle = vals.T;
+    if (vals.R !== undefined) ctrl.roll = vals.R;
+    if (vals.P !== undefined) ctrl.pitch = vals.P;
+  }
+
+  // ---- Dron fizikasi ----
+  let drone = {x:0, y:0, alt:0, heading:0, vx:0, vy:0, vz:0};
+  const trail = [];
+
+  function resetSim(){
+    drone = {x:0, y:0, alt:0, heading:0, vx:0, vy:0, vz:0};
+    trail.length = 0;
+  }
+  resetRoll:
+  resetBtn.addEventListener('click', resetSim);
+
+  function updatePhysics(dt){
+    keyboardControl();
+
+    const thr = ctrl.throttle/100;      // 0..1
+    const yawRate = (ctrl.yaw/100) * 90; // grad/sek
+    const rollDeg = (ctrl.roll/100) * 30;
+    const pitchDeg = (ctrl.pitch/100) * 30;
+
+    drone.heading += yawRate * dt;
+    const headRad = drone.heading * Math.PI/180;
+
+    // gaz balandlikka ta'sir qiladi
+    const targetVz = (thr - 0.5) * 6; // gaz 50% dan yuqori bo'lsa ko'tariladi
+    drone.vz += (targetVz - drone.vz) * dt * 2;
+    drone.alt = Math.max(0, drone.alt + drone.vz*dt);
+    if (drone.alt === 0) drone.vz = Math.max(0, drone.vz);
+
+    // pitch/roll gorizontal tezlikka ta'sir qiladi (dron burchagi bo'yicha)
+    const forwardSpd = (pitchDeg/30) * 8;
+    const lateralSpd = (rollDeg/30) * 8;
+
+    const targetVx = Math.sin(headRad)*forwardSpd + Math.cos(headRad)*lateralSpd;
+    const targetVy = -Math.cos(headRad)*forwardSpd + Math.sin(headRad)*lateralSpd;
+    drone.vx += (targetVx - drone.vx) * dt * 3;
+    drone.vy += (targetVy - drone.vy) * dt * 3;
+
+    drone.x += drone.vx * dt;
+    drone.y += drone.vy * dt;
+
+    trail.push({x:drone.x, y:drone.y});
+    if (trail.length > 300) trail.shift();
+
+    updateHUD(rollDeg, pitchDeg);
+  }
+
+  function updateHUD(rollDeg, pitchDeg){
+    document.getElementById('hAlt').textContent = drone.alt.toFixed(1)+' m';
+    const spd = Math.hypot(drone.vx, drone.vy);
+    document.getElementById('hSpd').textContent = spd.toFixed(1)+' m/s';
+    document.getElementById('hThr').textContent = Math.round(ctrl.throttle)+'%';
+    document.getElementById('hYaw').textContent = Math.round(((drone.heading%360)+360)%360)+'°';
+    document.getElementById('hRoll').textContent = Math.round(rollDeg)+'°';
+    document.getElementById('hPitch').textContent = Math.round(pitchDeg)+'°';
+    document.getElementById('hArm').textContent = drone.alt > 0.1 ? 'Uchmoqda' : (ctrl.throttle>0 ? 'Ko\'tarilmoqda' : 'Yerda');
+  }
+
+  // ---- Chizish: yuqoridan ko'rinish xarita ----
+  function drawMap(){
+    const w = mapCv.width, h = mapCv.height;
+    mctx.clearRect(0,0,w,h);
+    const scale = 6; // 1 metr = 6 piksel
+    const cx = w/2 - drone.x*scale;
+    const cy = h/2 - drone.y*scale;
+
+    // panjara
+    mctx.strokeStyle = '#1c2740';
+    mctx.lineWidth = 1;
+    const gridStep = 40;
+    const offX = ((cx % gridStep)+gridStep)%gridStep;
+    const offY = ((cy % gridStep)+gridStep)%gridStep;
+    for(let x=offX; x<w; x+=gridStep){ mctx.beginPath(); mctx.moveTo(x,0); mctx.lineTo(x,h); mctx.stroke(); }
+    for(let y=offY; y<h; y+=gridStep){ mctx.beginPath(); mctx.moveTo(0,y); mctx.lineTo(w,y); mctx.stroke(); }
+
+    // iz
+    mctx.strokeStyle = '#274b7a';
+    mctx.lineWidth = 2;
+    mctx.beginPath();
+    trail.forEach((p,i)=>{
+      const px = w/2 + (p.x-drone.x)*scale, py = h/2 + (p.y-drone.y)*scale;
+      if (i===0) mctx.moveTo(px,py); else mctx.lineTo(px,py);
+    });
+    mctx.stroke();
+
+    // dron (X shakli, heading bo'yicha aylantirilgan)
+    mctx.save();
+    mctx.translate(w/2, h/2);
+    mctx.rotate(drone.heading*Math.PI/180);
+    mctx.strokeStyle = '#4ade80';
+    mctx.lineWidth = 3;
+    mctx.beginPath();
+    mctx.moveTo(-12,-12); mctx.lineTo(12,12);
+    mctx.moveTo(12,-12); mctx.lineTo(-12,12);
+    mctx.stroke();
+    mctx.fillStyle = '#38bdf8';
+    mctx.beginPath(); mctx.moveTo(0,-16); mctx.lineTo(-6,-6); mctx.lineTo(6,-6); mctx.closePath(); mctx.fill();
+    mctx.restore();
+  }
+
+  // ---- Chizish: sun'iy gorizont (attitude indicator) ----
+  function drawAttitude(rollDeg, pitchDeg){
+    const w = attCv.width, h = attCv.height;
+    actx.clearRect(0,0,w,h);
+    actx.save();
+    actx.beginPath();
+    actx.arc(w/2, h/2, 95, 0, Math.PI*2);
+    actx.clip();
+
+    actx.save();
+    actx.translate(w/2, h/2);
+    actx.rotate(-rollDeg*Math.PI/180);
+    const pitchOffset = pitchDeg*2.2;
+    actx.fillStyle = '#3b82f6';
+    actx.fillRect(-150, -150+pitchOffset, 300, 150);
+    actx.fillStyle = '#7a5230';
+    actx.fillRect(-150, pitchOffset, 300, 150);
+    actx.strokeStyle = '#e8eef7';
+    actx.lineWidth = 2;
+    actx.beginPath(); actx.moveTo(-150, pitchOffset); actx.lineTo(150, pitchOffset); actx.stroke();
+    actx.restore();
+    actx.restore();
+
+    // markaziy belgi va ramka
+    actx.strokeStyle = '#e8eef7';
+    actx.lineWidth = 3;
+    actx.beginPath(); actx.arc(w/2,h/2,95,0,Math.PI*2); actx.stroke();
+    actx.beginPath();
+    actx.moveTo(w/2-20,h/2); actx.lineTo(w/2-6,h/2);
+    actx.moveTo(w/2+6,h/2); actx.lineTo(w/2+20,h/2);
+    actx.moveTo(w/2,h/2-6); actx.lineTo(w/2,h/2+6);
+    actx.stroke();
+  }
+
+  // ---- Asosiy sikl ----
+  let lastT = performance.now();
+  function loop(t){
+    const dt = Math.min(0.05, (t-lastT)/1000);
+    lastT = t;
+    updatePhysics(dt);
+    drawMap();
+    const rollDeg = (ctrl.roll/100)*30, pitchDeg = (ctrl.pitch/100)*30;
+    drawAttitude(rollDeg, pitchDeg);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
